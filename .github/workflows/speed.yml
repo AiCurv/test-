@@ -1,0 +1,61 @@
+name: Download Speed & Size Limit Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_url:
+        description: 'URL of the test file to download'
+        required: true
+        default: 'https://proof.ovh.net/files/100Mb.dat'
+      max_size_bytes:
+        description: 'Size limit in bytes; curl aborts if the file is larger'
+        required: true
+        default: '104857600'   # 100 MB
+
+jobs:
+  speed-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show runner disk space (before)
+        run: df -h /
+
+      - name: Download with curl and measure speed
+        env:
+          TEST_URL: ${{ inputs.test_url }}
+          MAX_SIZE: ${{ inputs.max_size_bytes }}
+        run: |
+          echo "URL: $TEST_URL"
+          echo "Max size limit: $MAX_SIZE bytes"
+          echo "---"
+          curl -L \
+            --max-filesize "$MAX_SIZE" \
+            --connect-timeout 15 \
+            --max-time 120 \
+            -o /tmp/downloaded_file \
+            -s -w "\n\n=== Download Report ===\n\
+          http_code=%{http_code}\n\
+          size_download=%{size_download} bytes\n\
+          speed_download=%{speed_download} bytes/s\n\
+          time_namelookup=%{time_namelookup}s\n\
+          time_connect=%{time_connect}s\n\
+          time_starttransfer=%{time_starttransfer}s\n\
+          time_total=%{time_total}s\n" \
+            "$TEST_URL" || echo "curl exit code: $? (may have stopped due to size limit or timeout)"
+
+      - name: Show downloaded file size (if it exists)
+        if: always()
+        run: |
+          if [ -f /tmp/downloaded_file ]; then
+            ls -lh /tmp/downloaded_file
+          else
+            echo "File was not downloaded (possibly blocked by --max-filesize or timeout)."
+          fi
+
+      - name: Show runner disk space (after)
+        if: always()
+        run: df -h /
