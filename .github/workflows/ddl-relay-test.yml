@@ -1,0 +1,162 @@
+name: DDL Download + Anonymous Upload Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      ddl_url:
+        description: "Direct download URL to test"
+        required: false
+        type: string
+        default: 'https://b6a3a2c1584bbac49ae84a20efcae68e.r2.cloudflarestorage.com/hub/4e725a4e804729b96ea507538767285e?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=ea90b4380eb601a081f170843f20c1c0%2F20261026%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20261026T214559Z&X-Amz-Expires=28800&X-Amz-SignedHeaders=host&response-content-disposition=attachment%3B%20filename%3D%22Hope.2026.1080p.AMZN.WEB-DL.Hindi.LiNE.DD2.0-Korean.DDP5.1.ESub.x264-HDHub4u.Ms.mkv%22&X-Amz-Signature=5e8fbd44c522ad4ae384ff2f2f54190f562c3ec56036caaa52d4fec7317316f0'
+      output_filename:
+        description: "Filename to upload to fuckingfast.net"
+        required: false
+        default: "Hope.2026.1080p.AMZN.WEB-DL.Hindi.LiNE.DD2.0-Korean.DDP5.1.ESub.x264-HDHub4u.Ms.mkv"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Check runner and tools
+        shell: bash
+        run: |
+          set -e
+          echo "=== Runner ==="
+          uname -a
+          echo
+          echo "=== Disk space ==="
+          df -h "$RUNNER_TEMP"
+          echo
+          curl --version | head -n 2
+
+      - name: Download from DDL and measure speed
+        id: download
+        env:
+          DDL_URL: ${{ inputs.ddl_url }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${DDL_URL:-}" ]]; then
+            echo "No ddl_url provided and no default set."
+            exit 1
+          fi
+
+          FILE="$RUNNER_TEMP/relay-benchmark.bin"
+          METRICS="$RUNNER_TEMP/download-metrics.txt"
+
+          echo "Starting DDL download..."
+          echo "URL is hidden to avoid exposing query tokens in logs."
+          echo "Start: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+
+          curl -fL -sS \
+            --retry 2 \
+            --retry-delay 3 \
+            --connect-timeout 30 \
+            --max-time 10800 \
+            -o "$FILE" \
+            -w 'HTTP_STATUS=%{http_code}\nDOWNLOAD_BYTES=%{size_download}\nDOWNLOAD_SECONDS=%{time_total}\nDOWNLOAD_BPS=%{speed_download}\n' \
+            "$DDL_URL" > "$METRICS"
+
+          cat "$METRICS"
+
+          SIZE=$(stat -c %s "$FILE")
+          echo
+          echo "=== Download results ==="
+          echo "File size: $SIZE bytes"
+
+          python3 - "$SIZE" "$METRICS" <<'PY'
+          import sys
+          size = int(sys.argv[1])
+          metrics = {}
+          for line in open(sys.argv[2]):
+              if "=" in line:
+                  k, v = line.strip().split("=", 1)
+                  metrics[k] = v
+
+          seconds = float(metrics.get("DOWNLOAD_SECONDS", 0))
+          bps = float(metrics.get("DOWNLOAD_BPS", 0))
+          actual = size / seconds if seconds > 0 else 0
+
+          print(f"Average download: {actual / 1e6:.2f} MB/s")
+          print(f"Average download: {actual * 8 / 1e6:.2f} Mbps")
+          print(f"Time per decimal GB: {1e9 / actual:.1f} seconds" if actual else "Time per GB: unavailable")
+          print(f"Estimated 1 GB: {1e9 / actual / 60:.2f} minutes" if actual else "")
+          print(f"curl-reported speed: {bps / 1e6:.2f} MB/s")
+          PY
+
+          echo
+          echo "=== Disk space after download ==="
+          df -h "$RUNNER_TEMP"
+
+      - name: Upload anonymously to fuckingfast.net
+        env:
+          OUTPUT_FILENAME: ${{ inputs.output_filename }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FILE="$RUNNER_TEMP/relay-benchmark.bin"
+          RESPONSE="$RUNNER_TEMP/upload-response.txt"
+          METRICS="$RUNNER_TEMP/upload-metrics.txt"
+
+          # Restrict the supplied name to a filename, not a path.
+          NAME=$(basename "$OUTPUT_FILENAME")
+          if [[ -z "$NAME" || "$NAME" == "." || "$NAME" == ".." ]]; then
+            echo "Invalid output filename"
+            exit 1
+          fi
+
+          # Percent-encode the filename for use in the URL path.
+          ENCODED_NAME=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$NAME")
+
+          echo "Starting anonymous upload..."
+          echo "Destination: fuckingfast.net"
+          echo "Filename: $NAME"
+          echo "File size: $(stat -c %s "$FILE") bytes"
+          echo "Start: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+
+          HTTP_CODE=$(curl -sS \
+            --connect-timeout 30 \
+            --max-time 10800 \
+            -T "$FILE" \
+            -o "$RESPONSE" \
+            -w '%{http_code}' \
+            "https://w.fuckingfast.net/$ENCODED_NAME")
+
+          cat > "$METRICS" <<EOF
+          HTTP_STATUS=$HTTP_CODE
+          EOF
+
+          echo "HTTP status: $HTTP_CODE"
+          echo
+          echo "=== Provider response ==="
+          cat "$RESPONSE"
+          echo
+
+          python3 - "$FILE" "$RESPONSE" "$HTTP_CODE" <<'PY'
+          import os, sys, json
+          path, response_path, status = sys.argv[1:]
+          size = os.path.getsize(path)
+
+          print(f"Uploaded file size: {size} bytes")
+          print(f"HTTP status: {status}")
+
+          try:
+              with open(response_path, encoding="utf-8") as f:
+                  data = json.load(f)
+              print("Parsed provider response:")
+              print(json.dumps(data, indent=2))
+          except Exception:
+              print("Provider response is not JSON; see raw response above.")
+          PY
+
+          echo
+          echo "NOTE: The upload HTTP response is printed above."
+          echo "Use the provider's returned link if the upload succeeded."
